@@ -5,6 +5,7 @@ import json
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 SOURCE_URL = os.getenv(
     "K3_HISTORY_URL",
@@ -16,7 +17,7 @@ REQUEST_TIMEOUT = float(os.getenv("K3_REQUEST_TIMEOUT", "8"))
 app = FastAPI(
     title="K3 1M JSON Prediction API",
     description="JSON-only API: 2-level pattern prediction.",
-    version="4.0.0",
+    version="5.0.0",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -104,18 +105,16 @@ def next_issue(issue):
         raise HTTPException(status_code=502, detail=f"Cannot increment: {issue!r}")
 
 # ==========================================================
-# LEVEL 1 — Core scoring engine (30+ patterns)
+# LEVEL 1 — Core scoring engine
 # ==========================================================
 def level1_score(sides, sums):
     scores = {"BIG": 0.0, "SMALL": 0.0}
     n = len(sides)
     newest = sides[0]
 
-    # 1. Recency weighted
     for age, side in enumerate(sides):
         scores[side] += max(1, 10 - age) * 0.9
 
-    # 2. Current streak
     streak = 0
     for s in sides:
         if s != newest:
@@ -128,35 +127,30 @@ def level1_score(sides, sums):
             other = "SMALL" if newest == "BIG" else "BIG"
             scores[other] += streak * 1.0
 
-    # 3. Last 5 trend
     l5 = sides[:5]
     if l5.count("BIG") >= 4:
         scores["BIG"] += 2.5
     elif l5.count("SMALL") >= 4:
         scores["SMALL"] += 2.5
 
-    # 4. Last 3 trend
     l3 = sides[:3]
     if l3.count("BIG") >= 3:
         scores["BIG"] += 2.0
     elif l3.count("SMALL") >= 3:
         scores["SMALL"] += 2.0
 
-    # 5. Zigzag last 6
     l6 = list(reversed(sides[:6]))
     sw = sum(l6[i] != l6[i-1] for i in range(1, len(l6)))
     if sw >= 4:
         other = "SMALL" if newest == "BIG" else "BIG"
         scores[other] += 2.2
 
-    # 6. Dominance reversal
     bc, sc = sides.count("BIG"), sides.count("SMALL")
     if bc >= 7:
         scores["SMALL"] += 2.0
     elif sc >= 7:
         scores["BIG"] += 2.0
 
-    # 7. Position bias
     odd = [sides[i] for i in range(0, n, 2)]
     even = [sides[i] for i in range(1, n, 2)]
     if odd.count("BIG") >= 4 and even.count("BIG") >= 4:
@@ -164,37 +158,22 @@ def level1_score(sides, sums):
     elif odd.count("SMALL") >= 4 and even.count("SMALL") >= 4:
         scores["SMALL"] += 1.0
 
-    # 8. Double pattern
     doubles = sum(1 for i in range(0, n-1, 2) if sides[i] == sides[i+1])
-    if doubles >= 3:
-        # doubles often continue in pairs
-        last_pair = sides[0] == sides[1] if n >= 2 else False
-        if last_pair:
-            other = "SMALL" if sides[0] == "BIG" else "BIG"
-            scores[other] += 0.8
+    if doubles >= 3 and n >= 2 and sides[0] == sides[1]:
+        other = "SMALL" if sides[0] == "BIG" else "BIG"
+        scores[other] += 0.8
 
-    # 9. Triple pattern
     triples = sum(1 for i in range(0, n-2, 3) if sides[i] == sides[i+1] == sides[i+2])
     if triples >= 1:
-        # after triple, expect break
         other = "SMALL" if sides[0] == "BIG" else "BIG"
         scores[other] += 1.2
 
-    # 10. Boundary volatility
-    boundary = sum(1 for s in sums[:5] if s in (9, 10, 11))
-    if boundary >= 3:
-        # high volatility zone — trust recent momentum
-        if sides[0] == sides[1] if n >= 2 else False:
-            scores[sides[0]] += 0.5
-
-    # 11. Sum trend
     if len(sums) >= 3:
         if sums[0] > sums[1] > sums[2]:
             scores["SMALL"] += 0.8
         elif sums[0] < sums[1] < sums[2]:
             scores["BIG"] += 0.8
 
-    # 12. Momentum shift
     if n >= 6:
         new3_big = sides[:3].count("BIG")
         old3_big = sides[3:6].count("BIG")
@@ -203,7 +182,6 @@ def level1_score(sides, sums):
         elif new3_big < old3_big - 1:
             scores["SMALL"] += 1.0
 
-    # 13. Extreme sum recovery
     if len(sums) >= 4:
         ex_small = sum(1 for s in sums[:4] if s <= 5)
         ex_big = sum(1 for s in sums[:4] if s >= 16)
@@ -212,28 +190,17 @@ def level1_score(sides, sums):
         elif ex_big >= 2:
             scores["SMALL"] += 1.0
 
-    # 14. Long-term 10-streak reversal
     if bc >= 8:
         scores["SMALL"] += 1.5
     elif sc >= 8:
         scores["BIG"] += 1.5
 
-    # 15. Alternation rate in last 8
     l8 = list(reversed(sides[:8]))
     sw8 = sum(l8[i] != l8[i-1] for i in range(1, len(l8)))
     if sw8 >= 6:
         other = "SMALL" if newest == "BIG" else "BIG"
         scores[other] += 1.5
 
-    # 16. Recent-2 consistency
-    if n >= 2:
-        if sides[0] == sides[1]:
-            scores[sides[0]] += 0.3
-        else:
-            # alternate pair — often continues alternating
-            scores[sides[0]] += 0.2
-
-    # Decide
     if scores["BIG"] > scores["SMALL"]:
         pred = "BIG"
     elif scores["SMALL"] > scores["BIG"]:
@@ -245,10 +212,10 @@ def level1_score(sides, sums):
     gap = abs(scores["BIG"] - scores["SMALL"])
     strength = round(min(95.0, 50.0 + (gap / max(total, 1.0)) * 45.0), 1)
 
-    return {"prediction": pred, "strength": strength, "scores": scores}
+    return {"prediction": pred, "strength": strength}
 
 # ==========================================================
-# LEVEL 2 — Override / validation (12+ rules)
+# LEVEL 2 — Override rules
 # ==========================================================
 def level2_override(sides, sums, l1):
     l1_pred = l1["prediction"]
@@ -257,24 +224,20 @@ def level2_override(sides, sums, l1):
     newest = sides[0]
     override = None
 
-    # A) Quad pattern BBSS / SSBB
     if n >= 4:
         l4 = sides[:4]
         if l4[0] == l4[1] and l4[2] != l4[1] and l4[3] == l4[2]:
             override = l4[0]
 
-    # B) Triple break
     if not override and n >= 3 and sides[0] == sides[1] == sides[2]:
         override = "SMALL" if sides[0] == "BIG" else "BIG"
 
-    # C) Strong zigzag (5+ switches in 6)
     if not override:
         l6 = list(reversed(sides[:6]))
         sw = sum(l6[i] != l6[i-1] for i in range(1, len(l6)))
         if sw >= 5:
             override = "SMALL" if newest == "BIG" else "BIG"
 
-    # D) Pattern repetition
     if not override:
         pstr = "".join("B" if s == "BIG" else "S" for s in sides)
         for length in (2, 3):
@@ -286,7 +249,6 @@ def level2_override(sides, sums, l1):
                     override = "BIG" if nxt == "B" else "SMALL"
                     break
 
-    # E) Low-confidence momentum fallback
     if not override and l1_str < 60:
         l3 = sides[:3]
         if l3.count("BIG") >= 2:
@@ -294,7 +256,6 @@ def level2_override(sides, sums, l1):
         elif l3.count("SMALL") >= 2:
             override = "SMALL"
 
-    # F) Anti-streak (>= 4)
     if not override:
         streak = 0
         for s in sides:
@@ -304,7 +265,6 @@ def level2_override(sides, sums, l1):
         if streak >= 4:
             override = "SMALL" if newest == "BIG" else "BIG"
 
-    # G) Dominance shift
     if not override:
         bc, sc = sides.count("BIG"), sides.count("SMALL")
         l3 = sides[:3]
@@ -313,7 +273,6 @@ def level2_override(sides, sums, l1):
         elif sc >= 7 and l3.count("BIG") >= 2:
             override = "BIG"
 
-    # H) Extreme sum recovery
     if not override and len(sums) >= 4:
         ex_small = sum(1 for s in sums[:4] if s <= 5)
         ex_big = sum(1 for s in sums[:4] if s >= 16)
@@ -322,26 +281,22 @@ def level2_override(sides, sums, l1):
         elif ex_big >= 2:
             override = "SMALL"
 
-    # I) 5-streak hard break
     if not override:
         if n >= 5 and len(set(sides[:5])) == 1:
             override = "SMALL" if newest == "BIG" else "BIG"
 
-    # J) 6-switch reversal (perfect zigzag 6)
     if not override:
         l7 = list(reversed(sides[:7]))
         sw7 = sum(l7[i] != l7[i-1] for i in range(1, len(l7)))
         if sw7 == 6:
             override = "SMALL" if newest == "BIG" else "BIG"
 
-    # K) Sum rebound (last 3 sums all rising or falling)
     if not override and len(sums) >= 3:
         if sums[0] > sums[1] > sums[2] and sums[0] >= 13:
             override = "SMALL"
         elif sums[0] < sums[1] < sums[2] and sums[0] <= 8:
             override = "BIG"
 
-    # L) 3-pair alternation
     if not override and n >= 6:
         p = sides[:6]
         if p[0] == p[2] == p[4] and p[1] == p[3] == p[5] and p[0] != p[1]:
@@ -367,9 +322,7 @@ def analyze(rows):
     l2 = level2_override(sides, sums, l1)
     return {
         "prediction": l2["prediction"],
-        "strength": l2["strength"],
         "source": l2["source"],
-        "level1_prediction": l1["prediction"],
     }
 
 # ==========================================================
@@ -380,19 +333,20 @@ async def root():
     return {
         "service": "K3 1M JSON Prediction API",
         "status": "ok",
-        "version": "4.0.0",
+        "version": "5.0.0",
     }
 
 @app.get("/health")
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "service": "k3-1m-json-prediction-api", "version": "4.0.0"}
+    return {"status": "ok", "service": "k3-1m-json-prediction-api", "version": "5.0.0"}
 
 @app.get("/predict")
 @app.get("/api/predict")
 async def predict():
     rows = await fetch_history()
-    current_issue = rows[0]["issueNumber"]
+    # period = current issue + 1 (prediction target)
+    period = next_issue(rows[0]["issueNumber"])
     result = analyze(rows)
 
     cache = _load_cache()
@@ -412,19 +366,23 @@ async def predict():
             previous_result = "WIN" if previous_prediction == previous_actual else "LOSS"
 
     cache["last_prediction"] = {
-        "period": current_issue,
+        "period": period,
         "prediction": result["prediction"],
     }
     _save_cache(cache)
 
-    # EXACT same format — no extra fields, no history
-    return {
+    payload = {
         "success": True,
-        "period": current_issue,
+        "period": period,
         "prediction": result["prediction"],
         "previous_period": previous_period,
         "previous_prediction": previous_prediction,
         "previous_actual": previous_actual,
         "previous_result": previous_result,
         "history_count_used": 10,
-}
+    }
+
+    # Pretty print with indent=2
+    return JSONResponse(content=payload, media_type="application/json; charset=utf-8", headers={
+        "X-Pretty": "true"
+    })
